@@ -257,9 +257,12 @@ def process_file(path: Path, target_root: Path, library_url: str, api_key: str) 
     if tags["asin"]:
         try:
             duplicate = find_duplicate_asin(library_url, api_key, tags["asin"])
-        except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            return None, f"failed to check Audiobookshelf duplicates: HTTP {exc.code}: {body}"
+        except (URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
             return None, f"failed to check Audiobookshelf duplicates: {exc}"
-        if duplicate:
+    if duplicate:
             return None, format_duplicate(duplicate)
 
     target_path = build_target_path(target_root, tags, path.suffix.lower())
