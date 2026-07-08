@@ -1,9 +1,14 @@
 import argparse
 import csv
+import json
+import os
 import re
 import shutil
 import sys
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from mutagen.mp4 import MP4
 
@@ -16,6 +21,36 @@ SERIES_CANDIDATES = ["series"]
 SERIES_PART_CANDIDATES = ["series-part", "series_part", "seriespart", "series_sequence", "series-sequence", "seriessequence"]
 YEAR_CANDIDATES = ["year"]
 ASIN_CANDIDATES = ["asin"]
+TRACK_TAG_KEYS = ("trkn", "track")
+
+
+def load_env(path: Path = Path(".env")) -> dict:
+    """Load simple KEY=VALUE pairs from a local .env file."""
+    values = dict(os.environ)
+    if not path.exists():
+        return values
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip("\"'")
+    return values
+
+
+def get_env_value(env: dict, *names: str) -> str:
+    for name in names:
+        value = env.get(name)
+        if value:
+            return value
+    return ""
+
+
+def get_abs_config(env: dict) -> tuple[str, str]:
+    library_url = get_env_value(env, "AUDIOBOOKSHELF_LIBRARY_URL", "ABS_LIBRARY_URL", "AUDIOBOOKSHELF_URL")
+    api_key = get_env_value(env, "AUDIOBOOKSHELF_API_KEY", "ABS_API_KEY", "AUDIOBOOKSHELF_TOKEN", "ABS_TOKEN")
+    return library_url.rstrip("/"), api_key
 
 
 def sanitize_component(name: str) -> str:
@@ -77,6 +112,79 @@ def read_raw_tags(path: Path) -> dict:
     return result
 
 
+def has_track_tag(path: Path) -> bool:
+    audio = MP4(str(path))
+    tags = audio.tags or {}
+    return any(key in tags and tags[key] for key in TRACK_TAG_KEYS)
+
+
+def clear_track_tag(path: Path) -> bool:
+    audio = MP4(str(path))
+    if audio.tags is None:
+        return False
+
+    changed = False
+    for key in TRACK_TAG_KEYS:
+        if key in audio.tags and audio.tags[key]:
+            del audio.tags[key]
+            changed = True
+
+    if changed:
+        audio.save()
+    return changed
+
+
+def abs_request_json(url: str, api_key: str) -> dict:
+    request = Request(url, headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"})
+    with urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def iter_abs_items(library_url: str, api_key: str):
+    parsed = urlparse(library_url)
+    if parsed.path.endswith("/items"):
+        items_url = library_url
+    else:
+        items_url = f"{library_url}/items"
+
+    page = 0
+    while True:
+        separator = "&" if "?" in items_url else "?"
+        data = abs_request_json(f"{items_url}{separator}{urlencode({'limit': 100, 'page': page})}", api_key)
+        items = data.get("results") or data.get("items") or data.get("libraryItems") or []
+        for item in items:
+            yield item
+
+        total = data.get("total")
+        if total is None or (page + 1) * 100 >= total or not items:
+            break
+        page += 1
+
+
+def item_asin(item: dict) -> str:
+    media = item.get("media") or {}
+    metadata = media.get("metadata") or item.get("mediaMetadata") or {}
+    return str(metadata.get("asin") or "").strip().lower()
+
+
+def find_duplicate_asin(library_url: str, api_key: str, asin: str) -> dict | None:
+    if not library_url or not api_key:
+        raise ValueError("missing Audiobookshelf library URL or API key in .env")
+
+    normalized_asin = asin.strip().lower()
+    for item in iter_abs_items(library_url, api_key):
+        if item_asin(item) == normalized_asin:
+            return item
+    return None
+
+
+def format_duplicate(item: dict) -> str:
+    media = item.get("media") or {}
+    metadata = media.get("metadata") or item.get("mediaMetadata") or {}
+    title = metadata.get("title") or item.get("relPath") or item.get("path") or item.get("id") or "unknown item"
+    return f"duplicate ASIN already exists in Audiobookshelf: {title}"
+
+
 def format_series_part(value: str) -> str:
     if not value:
         return value
@@ -126,7 +234,7 @@ def find_m4b_files(source: Path):
             yield path
 
 
-def process_file(path: Path, target_root: Path) -> tuple:
+def process_file(path: Path, target_root: Path, library_url: str, api_key: str) -> tuple:
     """Returns (target_path_or_None, reason_if_skipped)."""
     try:
         raw_tags = read_raw_tags(path)
@@ -140,6 +248,14 @@ def process_file(path: Path, target_root: Path) -> tuple:
     if not tags["album"]:
         return None, "missing album"
 
+    if tags["asin"]:
+        try:
+            duplicate = find_duplicate_asin(library_url, api_key, tags["asin"])
+        except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            return None, f"failed to check Audiobookshelf duplicates: {exc}"
+        if duplicate:
+            return None, format_duplicate(duplicate)
+
     target_path = build_target_path(target_root, tags, path.suffix.lower())
     return target_path, None
 
@@ -150,12 +266,15 @@ def run(source: Path, target: Path, dryrun: bool, csv_path: Path) -> None:
         print(f"No .m4b files found under {source}")
         return
 
+    env = load_env()
+    library_url, api_key = get_abs_config(env)
+
     rows = []
     moved = 0
     skipped = 0
 
     for path in files:
-        target_path, reason = process_file(path, target)
+        target_path, reason = process_file(path, target, library_url, api_key)
 
         if reason is not None:
             skipped += 1
@@ -163,9 +282,18 @@ def run(source: Path, target: Path, dryrun: bool, csv_path: Path) -> None:
             print(f"SKIP  {path}  ({reason})")
             continue
 
+        try:
+            track_tag_present = has_track_tag(path)
+        except Exception as exc:
+            skipped += 1
+            rows.append([str(path), str(target_path), "skip", f"failed to check track tag: {exc}"])
+            print(f"SKIP  {path}  (failed to check track tag: {exc})")
+            continue
+
         if dryrun:
             moved += 1
-            rows.append([str(path), str(target_path), "move", ""])
+            reason = "track tag would be removed" if track_tag_present else ""
+            rows.append([str(path), str(target_path), "move", reason])
             continue
 
         if target_path.exists():
@@ -173,6 +301,16 @@ def run(source: Path, target: Path, dryrun: bool, csv_path: Path) -> None:
             rows.append([str(path), str(target_path), "skip", "destination already exists"])
             print(f"SKIP  {path}  (destination already exists: {target_path})")
             continue
+
+        if track_tag_present:
+            try:
+                clear_track_tag(path)
+            except Exception as exc:
+                skipped += 1
+                rows.append([str(path), str(target_path), "skip", f"failed to clear track tag: {exc}"])
+                print(f"SKIP  {path}  (failed to clear track tag: {exc})")
+                continue
+            print(f"CLEAR {path}  (track tag removed)")
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), str(target_path))
