@@ -138,7 +138,7 @@ def abs_request_json(url: str, api_key: str) -> dict:
     request = Request(
         url,
         headers={
-            "X-API-Key": api_key,
+            "Authorization": f"Bearer {api_key}",
             "Accept": "application/json",
         },
     )
