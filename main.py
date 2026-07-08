@@ -345,18 +345,16 @@ def process_file(path: Path, target_root: Path, abs_client: AudiobookshelfClient
     if not tags["album"]:
         return None, "missing album"
 
-    if not tags["asin"]:
-        return None, "missing ASIN"
+    if tags["asin"]:
+        try:
+            duplicate = find_duplicate_asin(abs_client, tags["asin"])
+        except AudiobookshelfRequestError as exc:
+            return None, f"failed to check Audiobookshelf duplicates: {exc}"
+        except (URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            return None, f"failed to check Audiobookshelf duplicates: {exc}"
 
-    try:
-        duplicate = find_duplicate_asin(abs_client, tags["asin"])
-    except AudiobookshelfRequestError as exc:
-        return None, f"failed to check Audiobookshelf duplicates: {exc}"
-    except (URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
-        return None, f"failed to check Audiobookshelf duplicates: {exc}"
-
-    if duplicate:
-        return None, format_duplicate(duplicate)
+        if duplicate:
+            return None, format_duplicate(duplicate)
 
     target_path = build_target_path(target_root, tags, path.suffix.lower())
     return target_path, None
