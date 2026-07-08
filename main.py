@@ -135,7 +135,13 @@ def clear_track_tag(path: Path) -> bool:
 
 
 def abs_request_json(url: str, api_key: str) -> dict:
-    request = Request(url, headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"})
+    request = Request(
+        url,
+        headers={
+            "X-API-Key": api_key,
+            "Accept": "application/json",
+        },
+    )
     with urlopen(request, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
 
