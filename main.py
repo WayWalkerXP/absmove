@@ -20,7 +20,7 @@ ALBUM_CANDIDATES = ["album"]
 SERIES_CANDIDATES = ["series"]
 SERIES_PART_CANDIDATES = ["series-part", "series_part", "seriespart", "series_sequence", "series-sequence", "seriessequence"]
 YEAR_CANDIDATES = ["year"]
-ASIN_CANDIDATES = ["asin"]
+ASIN_CANDIDATES = ["asin", "ASIN"]
 TRACK_TAG_KEYS = ("trkn", "track")
 
 
