@@ -7,7 +7,7 @@ import shutil
 import sys
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from mutagen.mp4 import MP4
@@ -47,10 +47,54 @@ def get_env_value(env: dict, *names: str) -> str:
     return ""
 
 
-def get_abs_config(env: dict) -> tuple[str, str]:
-    library_url = get_env_value(env, "AUDIOBOOKSHELF_LIBRARY_URL", "ABS_LIBRARY_URL", "AUDIOBOOKSHELF_URL")
-    api_key = get_env_value(env, "AUDIOBOOKSHELF_API_KEY", "ABS_API_KEY", "AUDIOBOOKSHELF_TOKEN", "ABS_TOKEN")
-    return library_url.rstrip("/"), api_key
+def get_abs_config(env: dict) -> tuple[str, str, str]:
+    base_url = get_env_value(env, "AUDIOBOOKSHELF_URL", "ABS_URL")
+    library_id = get_env_value(env, "AUDIOBOOKSHELF_LIBRARY_ID", "ABS_LIBRARY_ID")
+    old_library_url = get_env_value(env, "AUDIOBOOKSHELF_LIBRARY_URL", "ABS_LIBRARY_URL")
+
+    if old_library_url:
+        print(
+            "Warning: AUDIOBOOKSHELF_LIBRARY_URL/ABS_LIBRARY_URL is deprecated; "
+            "use AUDIOBOOKSHELF_URL and AUDIOBOOKSHELF_LIBRARY_ID instead.",
+            file=sys.stderr,
+        )
+        old_base_url, old_library_id = split_legacy_library_url(old_library_url)
+        base_url = base_url or old_base_url
+        library_id = library_id or old_library_id
+
+    api_key = get_env_value(
+        env, "AUDIOBOOKSHELF_API_KEY", "ABS_API_KEY", "AUDIOBOOKSHELF_TOKEN", "ABS_TOKEN"
+    )
+    return normalize_abs_base_url(base_url), library_id.strip(), api_key
+
+
+def normalize_abs_base_url(base_url: str) -> str:
+    return base_url.strip().rstrip("/")
+
+
+def split_legacy_library_url(library_url: str) -> tuple[str, str]:
+    parsed = urlparse(library_url.strip())
+    path_parts = [part for part in parsed.path.split("/") if part]
+
+    try:
+        api_index = path_parts.index("api")
+    except ValueError:
+        return library_url.rstrip("/"), ""
+
+    if path_parts[api_index + 1:api_index + 2] != ["libraries"] or len(path_parts) <= api_index + 2:
+        return library_url.rstrip("/"), ""
+
+    base_path = "/" + "/".join(path_parts[:api_index]) if api_index else ""
+    base_url = urlunparse((parsed.scheme, parsed.netloc, base_path.rstrip("/"), "", "", ""))
+    return base_url.rstrip("/"), path_parts[api_index + 2]
+
+
+def build_abs_url(base_url: str, *path_parts: str, query: dict | None = None) -> str:
+    path = "/".join(str(part).strip("/") for part in path_parts if str(part).strip("/"))
+    url = f"{base_url.rstrip('/')}/{path}"
+    if query:
+        url = f"{url}?{urlencode(query)}"
+    return url
 
 
 def sanitize_component(name: str) -> str:
@@ -134,37 +178,76 @@ def clear_track_tag(path: Path) -> bool:
     return changed
 
 
-def abs_request_json(url: str, api_key: str) -> dict:
-    request = Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json",
-        },
-    )
-    with urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+class AudiobookshelfRequestError(RuntimeError):
+    def __init__(self, url: str, status: int | None = None, response_body: str = ""):
+        self.url = url
+        self.status = status
+        self.response_body = response_body
+        super().__init__(self.format_message())
+
+    def format_message(self) -> str:
+        parts = ["Audiobookshelf request failed.", "", "URL:", self.url]
+        if self.status is not None:
+            parts.extend(["", f"HTTP {self.status}"])
+        if self.response_body:
+            parts.extend(["", "Response:", self.response_body])
+        return "\n".join(parts)
 
 
-def iter_abs_items(library_url: str, api_key: str):
-    parsed = urlparse(library_url)
-    if parsed.path.endswith("/items"):
-        items_url = library_url
-    else:
-        items_url = f"{library_url}/items"
+class AudiobookshelfClient:
+    def __init__(self, base_url: str, library_id: str, api_key: str):
+        self.base_url = base_url
+        self.library_id = library_id
+        self.api_key = api_key
 
-    page = 0
-    while True:
-        separator = "&" if "?" in items_url else "?"
-        data = abs_request_json(f"{items_url}{separator}{urlencode({'limit': 100, 'page': page})}", api_key)
-        items = data.get("results") or data.get("items") or data.get("libraryItems") or []
-        for item in items:
-            yield item
+    def require_config(self) -> None:
+        if not self.base_url or not self.library_id or not self.api_key:
+            raise ValueError(
+                "missing AUDIOBOOKSHELF_URL, AUDIOBOOKSHELF_LIBRARY_ID, "
+                "or AUDIOBOOKSHELF_API_KEY in .env"
+            )
 
-        total = data.get("total")
-        if total is None or (page + 1) * 100 >= total or not items:
-            break
-        page += 1
+    def library_url(self, *path_parts: str, query: dict | None = None) -> str:
+        return build_abs_url(
+            self.base_url, "api", "libraries", self.library_id, *path_parts, query=query
+        )
+
+    def request_json(self, url: str) -> dict:
+        request = Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise AudiobookshelfRequestError(url, exc.code, body) from exc
+
+    def iter_items(self):
+        page = 0
+        while True:
+            url = self.library_url("items", query={"limit": 100, "page": page})
+            data = self.request_json(url)
+            items = data.get("results") or data.get("items") or data.get("libraryItems") or []
+            for item in items:
+                yield item
+
+            total = data.get("total")
+            if total is None or (page + 1) * 100 >= total or not items:
+                break
+            page += 1
+
+    def search_items(self, query: str, limit: int = 10):
+        data = self.request_json(self.library_url("search", query={"q": query, "limit": limit}))
+        results = data.get("book") or data.get("podcast") or []
+        for result in results:
+            item = result.get("libraryItem") or result
+            if item:
+                yield item
 
 
 def item_asin(item: dict) -> str:
@@ -173,12 +256,20 @@ def item_asin(item: dict) -> str:
     return str(metadata.get("asin") or "").strip().lower()
 
 
-def find_duplicate_asin(library_url: str, api_key: str, asin: str) -> dict | None:
-    if not library_url or not api_key:
-        raise ValueError("missing Audiobookshelf library URL or API key in .env")
-
+def find_duplicate_asin(client: AudiobookshelfClient, asin: str) -> dict | None:
+    client.require_config()
     normalized_asin = asin.strip().lower()
-    for item in iter_abs_items(library_url, api_key):
+
+    # Audiobookshelf documents library search but not a native ASIN-only filter.
+    # Query by ASIN first to avoid downloading large libraries, then validate the
+    # returned metadata exactly because search can match fields other than ASIN.
+    for item in client.search_items(asin):
+        if item_asin(item) == normalized_asin:
+            return item
+
+    # Keep the previous exact behavior as a conservative fallback in case a server
+    # version does not index ASINs in library search results.
+    for item in client.iter_items():
         if item_asin(item) == normalized_asin:
             return item
     return None
@@ -240,7 +331,7 @@ def find_m4b_files(source: Path):
             yield path
 
 
-def process_file(path: Path, target_root: Path, library_url: str, api_key: str) -> tuple:
+def process_file(path: Path, target_root: Path, abs_client: AudiobookshelfClient) -> tuple:
     """Returns (target_path_or_None, reason_if_skipped)."""
     try:
         raw_tags = read_raw_tags(path)
@@ -254,16 +345,18 @@ def process_file(path: Path, target_root: Path, library_url: str, api_key: str) 
     if not tags["album"]:
         return None, "missing album"
 
-    if tags["asin"]:
-        try:
-            duplicate = find_duplicate_asin(library_url, api_key, tags["asin"])
-        except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            return None, f"failed to check Audiobookshelf duplicates: HTTP {exc.code}: {body}"
-        except (URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
-            return None, f"failed to check Audiobookshelf duplicates: {exc}"
+    if not tags["asin"]:
+        return None, "missing ASIN"
+
+    try:
+        duplicate = find_duplicate_asin(abs_client, tags["asin"])
+    except AudiobookshelfRequestError as exc:
+        return None, f"failed to check Audiobookshelf duplicates: {exc}"
+    except (URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+        return None, f"failed to check Audiobookshelf duplicates: {exc}"
+
     if duplicate:
-            return None, format_duplicate(duplicate)
+        return None, format_duplicate(duplicate)
 
     target_path = build_target_path(target_root, tags, path.suffix.lower())
     return target_path, None
@@ -276,14 +369,15 @@ def run(source: Path, target: Path, dryrun: bool, csv_path: Path) -> None:
         return
 
     env = load_env()
-    library_url, api_key = get_abs_config(env)
+    base_url, library_id, api_key = get_abs_config(env)
+    abs_client = AudiobookshelfClient(base_url, library_id, api_key)
 
     rows = []
     moved = 0
     skipped = 0
 
     for path in files:
-        target_path, reason = process_file(path, target, library_url, api_key)
+        target_path, reason = process_file(path, target, abs_client)
 
         if reason is not None:
             skipped += 1
